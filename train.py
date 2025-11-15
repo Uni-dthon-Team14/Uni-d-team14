@@ -1,111 +1,120 @@
+# train.py
 import os
 import argparse
-from tqdm import tqdm
-
+import random
+import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
-# Multilingual BERT 모델에서 임베딩 레이어 추출을 위해 BertModel 임포트
-from transformers import BertModel 
+import torch.nn.functional as F
 
-from preprocess import get_data_loaders, seed_everything, CFG
-from model import VisionLanguageModel
+from config import CFG
+from model import CrossAttnVLM
+from preprocess import make_loader, Vocab
 
-# --- 손실 함수 (Loss Function) ---
-class BBoxLoss(nn.Module):
-    """BBox 예측을 위한 L1 Loss"""
-    def __init__(self):
-        super().__init__()
-        self.l1_loss = nn.L1Loss(reduction='mean')
 
-    def forward(self, pred_bbox: torch.Tensor, gt_bbox: torch.Tensor) -> torch.Tensor:
-        return self.l1_loss(pred_bbox, gt_bbox)
+def seed_everything(seed=CFG.SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-# --- 학습 루프 ---
-def train_loop(args: argparse.Namespace):
-    seed_everything(CFG.SEED)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # 1. Multilingual BERT 모델에서 임베딩 레이어만 로드
-    print(f"Loading BERT embeddings layer from {CFG.TOKENIZER_PATH}...")
-    # 전체 모델을 로드하되, 언어 인코더로는 사용하지 않고, 임베딩 레이어만 추출합니다.
-    bert_model = BertModel.from_pretrained(CFG.TOKENIZER_PATH)
-    # word_embeddings만 추출하여 트랜스포머 백본 사용을 회피합니다.
-    embedding_layer = bert_model.embeddings.word_embeddings.to(device)
-    
-    # 2. 데이터 로더
-    print(f"Loading data from {args.data_root}...")
-    train_loader, val_loader, _ = get_data_loaders(args.data_root, args.batch_size, args.num_workers)
 
-    # 3. 모델 정의
-    model = VisionLanguageModel(embeddings_layer=embedding_layer).to(device)
-    
-    # 4. 옵티마이저 및 손실 함수
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
-    criterion = BBoxLoss()
+def train(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
 
-    best_val_loss = float('inf')
-    
-    print(f"Start training on {device} for {args.epochs} epochs.")
-    
-    for epoch in range(args.epochs):
-        # --- Training Phase ---
+    # 1) 데이터 / vocab
+    ds, dl = make_loader(
+        json_dir=args.json_dir,
+        jpg_dir=args.jpg_dir,
+        vocab=None,
+        build_vocab=True,
+        shuffle=True,
+    )
+
+    vocab = ds.dataset.vocab if isinstance(ds, torch.utils.data.Subset) else ds.vocab
+    print("Vocab size:", len(vocab.itos))
+
+    # 2) 모델
+    model = CrossAttnVLM(len(vocab.itos), dim=args.dim, pretrained_backbone=not args.no_pretrain).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
+
+    total = len(ds)
+    print("Train samples:", total)
+
+    for ep in range(1, args.epochs + 1):
         model.train()
-        train_loss = 0.0
-        
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} (Train)")
-        for images, input_ids, attention_mask, gt_bbox in pbar:
-            images, input_ids, attention_mask, gt_bbox = images.to(device), input_ids.to(device), attention_mask.to(device), gt_bbox.to(device)
-            
-            optimizer.zero_grad()
-            
-            predicted_bbox = model(images, input_ids, attention_mask)
-            
-            loss = criterion(predicted_bbox, gt_bbox)
-            
-            loss.backward()
-            optimizer.step()
-            
-            train_loss += loss.item()
-            pbar.set_postfix({'Loss': f'{loss.item():.4f}'})
+        running = 0.0
 
-        avg_train_loss = train_loss / len(train_loader)
+        for imgs, ids, lens, targets, metas in dl:
+            valid_idx = [i for i, t in enumerate(targets) if t is not None]
+            if not valid_idx:
+                continue
 
-        # --- Validation Phase ---
-        model.eval()
-        val_loss = 0.0
-        
-        with torch.no_grad():
-            for images, input_ids, attention_mask, gt_bbox in val_loader:
-                images, input_ids, attention_mask, gt_bbox = images.to(device), input_ids.to(device), attention_mask.to(device), gt_bbox.to(device)
-                
-                predicted_bbox = model(images, input_ids, attention_mask)
-                loss = criterion(predicted_bbox, gt_bbox)
-                val_loss += loss.item()
+            imgs = imgs[valid_idx].to(device)
+            ids = ids[valid_idx].to(device)
+            lens = lens[valid_idx].to(device)
+            t = torch.stack([targets[i] for i in valid_idx], dim=0).to(device)
 
-        avg_val_loss = val_loss / len(val_loader)
-        
-        print(f"\n[Epoch {epoch+1}] Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+            optimizer.zero_grad(set_to_none=True)
 
-        # --- 모델 저장 ---
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            os.makedirs(args.ckpt_dir, exist_ok=True)
-            ckpt_path = os.path.join(args.ckpt_dir, f'best_model.pth')
-            torch.save(model.state_dict(), ckpt_path) 
-            print(f"Saved best model checkpoint to {ckpt_path}")
+            with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
+                pred = model(imgs, ids, lens)
+                # (cx, cy, w, h) - y 축에 조금 더 가중치
+                loss_cx = F.smooth_l1_loss(pred[:, 0], t[:, 0])
+                loss_cy = F.smooth_l1_loss(pred[:, 1], t[:, 1])
+                loss_w = F.smooth_l1_loss(pred[:, 2], t[:, 2])
+                loss_h = F.smooth_l1_loss(pred[:, 3], t[:, 3])
+                loss = (1 * loss_cx + 2 * loss_cy + 1 * loss_w + 2 * loss_h) / 6.0
 
-def main():
-    parser = argparse.ArgumentParser(description="Vision-Language Model Training")
-    parser.add_argument('--data_root', type=str, default='./data', help='Root directory of the dataset (default: ./data)')
-    parser.add_argument('--ckpt_dir', type=str, default='./checkpoints', help='Directory to save model checkpoints')
-    parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
-    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of worker threads for data loading')
-    
-    args = parser.parse_args()
-    train_loop(args)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
-if __name__ == '__main__':
-    main()
+            running += loss.item() * imgs.size(0)
+
+        scheduler.step()
+        avg = running / max(1, total)
+        print(f"[Epoch {ep}/{args.epochs}] loss={avg:.4f}")
+
+    os.makedirs(os.path.dirname(args.save_ckpt), exist_ok=True)
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "vocab_itos": vocab.itos,
+            "dim": args.dim,
+            "img_size": args.img_size,
+            "no_pretrain": args.no_pretrain,
+        },
+        args.save_ckpt,
+    )
+    print("✅ Saved ckpt to", args.save_ckpt)
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--json_dir", default=CFG.TRAIN_JSON_DIR)
+    p.add_argument("--jpg_dir", default=CFG.TRAIN_JPG_DIR)
+    p.add_argument("--epochs", type=int, default=CFG.EPOCHS)
+    p.add_argument("--lr", type=float, default=CFG.LEARNING_RATE)
+    p.add_argument("--batch_size", type=int, default=CFG.BATCH_SIZE)
+    p.add_argument("--img_size", type=int, default=CFG.IMG_SIZE)
+    p.add_argument("--dim", type=int, default=CFG.DIM)
+    p.add_argument("--num_workers", type=int, default=CFG.NUM_WORKERS)
+    p.add_argument("--footer_crop_ratio", type=float, default=CFG.FOOTER_CROP_RATIO)
+    p.add_argument("--no_pretrain", action="store_true")
+    p.add_argument("--save_ckpt", default=CFG.CKPT_PATH)
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    seed_everything()
+    args = parse_args()
+    # DataLoader 전역 설정용으로 CFG 값도 맞춰두기
+    CFG.IMG_SIZE = args.img_size
+    CFG.BATCH_SIZE = args.batch_size
+    CFG.NUM_WORKERS = args.num_workers
+    CFG.FOOTER_CROP_RATIO = args.footer_crop_ratio
+    train(args)

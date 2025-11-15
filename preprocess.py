@@ -1,194 +1,261 @@
+# preprocess.py
 import os
 import json
-import random
-from glob import glob
-from PIL import Image
-from typing import List, Tuple, Dict, Any
+import glob
+from typing import List, Dict, Any
 
+import numpy as np
+from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from transformers import BertModel, BertTokenizer 
 
-# --- 설정 (Configuration) ---
-class CFG:
-    SEED = 42
-    IMG_SIZE = 512
-    MAX_QUERY_LEN = 128
-    # KoBERT 대신 설치가 용이한 Multilingual BERT 체크포인트 사용
-    TOKENIZER_PATH = 'bert-base-multilingual-cased'  
+try:
+    from torchvision import transforms as T
+    _BACKBONE_OK = True
+except:
+    _BACKBONE_OK = False
+    T = None
 
-# --- 유틸리티 함수 ---
-def seed_everything(seed):
-    random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+from config import CFG
 
-def normalize_bbox(bbox: List[float], width: float, height: float) -> List[float]:
-    """BBox [x, y, w, h]를 0~1 사이의 정규화된 좌표로 변환"""
-    x, y, w, h = bbox
-    x_norm = x / width
-    y_norm = y / height
-    w_norm = w / width
-    h_norm = h / height
-    return [x_norm, y_norm, w_norm, h_norm]
 
-def denormalize_bbox(bbox_norm: List[float], width: float, height: float) -> List[float]:
-    """정규화된 BBox를 원본 해상도 기준의 절대 좌표로 역변환"""
-    x_norm, y_norm, w_norm, h_norm = bbox_norm
-    x_abs = x_norm * width
-    y_abs = y_norm * height
-    w_abs = w_norm * width
-    h_abs = h_norm * height
-    return [x_abs, y_abs, w_abs, h_abs]
+############################################################
+# JSON 검색
+############################################################
+def find_jsons(json_dir: str):
+    if not os.path.isdir(json_dir):
+        raise FileNotFoundError(f"json_dir not found → {json_dir}")
+    return sorted(glob.glob(os.path.join(json_dir, "*.json")))
 
-# --- Dataset 클래스 ---
-class CustomDataset(Dataset):
-    def __init__(self, root_dir: str, mode: str, transform=None, tokenizer=None):
-        self.mode = mode
-        self.transform = transform
-        # BertTokenizer 사용
-        self.tokenizer = tokenizer if tokenizer else BertTokenizer.from_pretrained(CFG.TOKENIZER_PATH)
-        self.data_list = self._load_data(root_dir, mode)
 
-    def _load_data(self, root_dir: str, mode: str) -> List[Dict[str, Any]]:
-        """제시된 폴더 구조에 맞게 데이터 경로를 설정하고 파일을 로드합니다."""
-        data_list = []
-        
-        data_folder_name = 'train_data' if mode in ['train', 'val'] else 'test_data'
-        data_sub_folder_name = mode if mode in ['train', 'val'] else 'test'
-        
-        base_path = os.path.join(root_dir, data_folder_name, data_sub_folder_name) 
+############################################################
+# JSON 로딩
+############################################################
+def read_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-        if mode in ['train', 'val']:
-            for doc_type in ['press', 'report']:
-                json_path = os.path.join(base_path, f'{doc_type}_json')
-                
-                # --- ✅ 수정된 부분: 이미지 폴더 이름을 press/report 모두 '_jpg'로 통일 ---
-                img_folder_name = f'{doc_type}_jpg'
-                img_path = os.path.join(base_path, img_folder_name)
 
-                for json_file in glob(os.path.join(json_path, '*.json')):
-                    try:
-                        with open(json_file, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                    except json.JSONDecodeError:
-                        continue 
-                    
-                    img_filename = data['source_data_info']['source_data_name_jpg']
-                    img_file = os.path.join(img_path, img_filename)
-                    resolution = data['source_data_info']['document_resolution'] # [W, H]
+############################################################
+# 이미지 매칭
+############################################################
+def get_image_path(json_path, data, jpg_dir):
+    candidates = []
+    info = data.get("source_data_info", {})
 
-                    for anno in data['learning_data_info']['annotation']:
-                        class_name = anno.get('class_name', '')
-                        if class_name in ['표', '차트(세로 막대형)', '차트(꺾은선형)', '차트'] and 'visual_instruction' in anno:
-                            data_list.append({
-                                'img_path': img_file,
-                                'query': anno['visual_instruction'],
-                                'bbox': anno['bounding_box'],  # [x, y, w, h]
-                                'instance_id': anno['instance_id'],
-                                'resolution': resolution
-                            })
+    # 우선순위 후보들
+    for key in ["source_data_name_jpg", "source_image", "source_data_name"]:
+        if key in info:
+            val = str(info[key]).strip()
+            if val:
+                candidates.append(val)
 
-        elif mode == 'test':
-            query_path = os.path.join(base_path, 'query') 
-            img_path = os.path.join(base_path, 'images') 
+    # JSON베이스 이름 기반 이미지
+    base = os.path.splitext(os.path.basename(json_path))[0]
+    candidates += [f"{base}.jpg", f"{base}.png"]
 
-            for json_file in glob(os.path.join(query_path, '*.json')):
-                    try:
-                        with open(json_file, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                    except json.JSONDecodeError:
-                        continue
-                
-                    img_filename = data['source_data_info']['source_data_name_jpg']
-                    img_file = os.path.join(img_path, img_filename)
-                    resolution = data['source_data_info']['document_resolution'] # [W, H]
+    candidates = list(set(candidates))
+    if jpg_dir is None:
+        return None
 
-                    for anno in data['learning_data_info']['annotation']:
-                        if 'visual_instruction' in anno:
-                            data_list.append({
-                                'img_path': img_file,
-                                'query': anno['visual_instruction'],
-                                'instance_id': anno['instance_id'],
-                                'resolution': resolution
-                            })
-        return data_list
+    all_imgs = os.listdir(jpg_dir)
+
+    # 1) 정확히 일치
+    for c in candidates:
+        p = os.path.join(jpg_dir, c)
+        if os.path.exists(p):
+            return p
+
+    # 2) 부분 일치
+    for c in candidates:
+        key = c.replace(".jpg", "").replace(".png", "")
+        for f in all_imgs:
+            if key in f:
+                return os.path.join(jpg_dir, f)
+
+    print(f"[MISS IMG] {json_path} | candidates={candidates}")
+    return None
+
+
+############################################################
+# 토큰화
+############################################################
+def simple_tokenize(s: str):
+    if not s:
+        return []
+    for ch in [",", "(", ")", ":", "?", "!", "·"]:
+        s = s.replace(ch, " ")
+    return s.strip().split()
+
+
+############################################################
+# Vocab
+############################################################
+class Vocab:
+    def __init__(self):
+        self.freq = {}
+        self.itos = ["<pad>", "<unk>"]
+        self.stoi = {tok:i for i,tok in enumerate(self.itos)}
+
+    def build(self, texts):
+        for t in texts:
+            for tok in simple_tokenize(t):
+                self.freq[tok] = self.freq.get(tok, 0) + 1
+
+        for tok, _ in sorted(self.freq.items(), key=lambda x: -x[1]):
+            if tok not in self.stoi:
+                self.stoi[tok] = len(self.itos)
+                self.itos.append(tok)
+
+    def encode(self, s, max_len=40):
+        toks = simple_tokenize(s)[:max_len]
+        if not toks:
+            return [1]
+        return [self.stoi.get(t, 1) for t in toks]
+
+
+############################################################
+# Dataset (✨ JSON 1개 = row 1개 보장)
+############################################################
+class UniDSet(Dataset):
+    def __init__(self, json_files, jpg_dir, vocab, build_vocab=False,
+                 resize_to=(CFG.IMG_SIZE, CFG.IMG_SIZE),
+                 test_mode=False):
+
+        self.items = []
+        for jf in json_files:
+            data = read_json(jf)
+            ann_list = data.get("learning_data_info", {}).get("annotation", [])
+            img_path = get_image_path(jf, data, jpg_dir)
+
+            # --------------------------
+            # ⭐ 핵심 : JSON 1개당 row 1개 생성
+            # --------------------------
+
+            if len(ann_list) == 0:
+                # annotation 없음 → dummy row
+                self.items.append({
+                    "json": jf,
+                    "img": img_path,
+                    "query": "",
+                    "bbox": None,
+                    "query_id": os.path.basename(jf).replace(".json", "")
+                })
+
+            else:
+                # annotation 있음 → 첫 번째 것만 사용
+                a = ann_list[0]
+                self.items.append({
+                    "json": jf,
+                    "img": img_path,
+                    "query": a.get("visual_instruction", ""),
+                    "bbox": a.get("bounding_box"),
+                    "query_id": a.get("instance_id"),
+                })
+
+        # vocab
+        self.vocab = vocab
+        if build_vocab:
+            self.vocab.build([it["query"] for it in self.items])
+
+        # transforms
+        self.resize_to = resize_to
+        if _BACKBONE_OK:
+            from torchvision import transforms as T
+            self.tf = T.Compose([T.Resize(resize_to), T.ToTensor()])
+        else:
+            self.tf = None
 
     def __len__(self):
-        return len(self.data_list)
+        return len(self.items)
 
-    def __getitem__(self, idx: int):
-        data = self.data_list[idx]
-        
-        # 1. 이미지 로드 및 변환
-        image = Image.open(data['img_path']).convert('RGB')
-        if self.transform:
-            image_tensor = self.transform(image)
+    @staticmethod
+    def _pil_to_tensor(img):
+        arr = np.array(img).astype(np.float32) / 255.
+        if len(arr.shape)==2:
+            arr = np.stack([arr]*3, -1)
+        arr = arr.transpose(2,0,1)
+        return torch.tensor(arr)
+
+    def __getitem__(self, idx):
+        it = self.items[idx]
+
+        if it["img"] is None:
+            img = Image.new("RGB", self.resize_to, (0,0,0))
+            W0, H0 = self.resize_to
         else:
-            image_tensor = transforms.ToTensor()(image)
+            img = Image.open(it["img"]).convert("RGB")
+            W0, H0 = img.size
 
-        # 2. 질의 토큰화
-        tokenized_query = self.tokenizer(
-            data['query'],
-            padding='max_length',
-            truncation=True,
-            max_length=CFG.MAX_QUERY_LEN,
-            return_tensors='pt'
-        )
-        
-        # 3. 레이블(BBox) 처리
-        width, height = data['resolution']
-        
-        if self.mode in ['train', 'val']:
-            # 훈련/검증: BBox 정규화
-            bbox_norm = normalize_bbox(data['bbox'], width, height)
-            bbox_tensor = torch.tensor(bbox_norm, dtype=torch.float)
-            
-            return image_tensor, tokenized_query['input_ids'].squeeze(0), tokenized_query['attention_mask'].squeeze(0), bbox_tensor
+        # resize
+        if self.tf:
+            img_t = self.tf(img)
+        else:
+            img = img.resize(self.resize_to)
+            img_t = self._pil_to_tensor(img)
 
-        elif self.mode == 'test':
-            # 테스트: Instance ID와 해상도 반환
-            return image_tensor, tokenized_query['input_ids'].squeeze(0), tokenized_query['attention_mask'].squeeze(0), data['instance_id'], torch.tensor([width, height], dtype=torch.float)
+        # tokenize
+        ids = self.vocab.encode(it["query"])
+        L = len(ids)
+
+        return {
+            "image": img_t,
+            "query_ids": torch.tensor(ids),
+            "length": torch.tensor(L),
+            "target": None,                # test mode no bbox
+            "orig_size": (W0, H0),
+            "query_id": it["query_id"],
+            "query_text": it["query"]
+        }
 
 
-# --- 데이터셋/로더 생성 함수 ---
-def get_data_loaders(root_dir: str, batch_size: int, num_workers: int) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    transform = transforms.Compose([
-        transforms.Resize((CFG.IMG_SIZE, CFG.IMG_SIZE)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    tokenizer = BertTokenizer.from_pretrained(CFG.TOKENIZER_PATH)
-    
-    train_dataset = CustomDataset(root_dir, 'train', transform=transform, tokenizer=tokenizer)
-    val_dataset = CustomDataset(root_dir, 'val', transform=transform, tokenizer=tokenizer)
-    test_dataset = CustomDataset(root_dir, 'test', transform=transform, tokenizer=tokenizer)
+############################################################
+# Collate
+############################################################
+def collate_fn(batch):
+    B = len(batch)
+    max_len = max(b["length"] for b in batch)
 
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=num_workers,
-        pin_memory=True
+    ids = torch.zeros(B, max_len, dtype=torch.long)
+    lens = torch.zeros(B, dtype=torch.long)
+    imgs = torch.stack([b["image"] for b in batch])
+
+    metas = []
+    for i,b in enumerate(batch):
+        L = b["length"]
+        ids[i,:L] = b["query_ids"][:L]
+        lens[i] = L
+        metas.append({
+            "orig_size": b["orig_size"],
+            "query_id": b["query_id"],
+            "query_text": b["query_text"]
+        })
+
+    return imgs, ids, lens, [None]*B, metas
+
+
+############################################################
+# Loader
+############################################################
+def make_loader(json_dir, jpg_dir, vocab, build_vocab,
+                batch_size=CFG.BATCH_SIZE, img_size=CFG.IMG_SIZE,
+                num_workers=CFG.NUM_WORKERS, shuffle=False):
+
+    json_files = find_jsons(json_dir)
+
+    ds = UniDSet(
+        json_files=json_files,
+        jpg_dir=jpg_dir,
+        vocab=vocab,
+        build_vocab=build_vocab,
+        resize_to=(img_size,img_size),
+        test_mode=True
     )
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        num_workers=num_workers,
-        pin_memory=True
-    )
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        num_workers=num_workers,
-        pin_memory=True
+
+    dl = DataLoader(
+        ds, batch_size=batch_size,
+        shuffle=shuffle, num_workers=num_workers,
+        collate_fn=collate_fn
     )
 
-    return train_loader, val_loader, test_loader
+    return ds, dl

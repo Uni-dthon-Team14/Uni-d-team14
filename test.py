@@ -1,93 +1,121 @@
 import os
+import json
 import argparse
 import pandas as pd
-from tqdm import tqdm
-
 import torch
-from transformers import BertModel
+from glob import glob
+from torch.utils.data import DataLoader
 
-from preprocess import get_data_loaders, seed_everything, denormalize_bbox, CFG
-from model import VisionLanguageModel
+# ✔ model.py에서 모델만 가져옴
+from model import CrossAttnVLM
 
-# --- 추론 루프 ---
-def predict_loop(args: argparse.Namespace):
-    seed_everything(CFG.SEED)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # 1. Multilingual BERT 모델에서 임베딩 레이어만 로드
-    print(f"Loading BERT embeddings layer from {CFG.TOKENIZER_PATH}...")
-    bert_model = BertModel.from_pretrained(CFG.TOKENIZER_PATH)
-    embedding_layer = bert_model.embeddings.word_embeddings.to(device)
+# ✔ Vocab, UniDSet는 preprocess.py에서 가져옴
+from preprocess import Vocab, UniDSet, collate_fn
 
-    # 2. 데이터 로더
-    print(f"Loading test data from {args.data_root}...")
-    _, _, test_loader = get_data_loaders(args.data_root, args.batch_size, args.num_workers)
 
-    # 3. 모델 정의 및 가중치 로드
-    model = VisionLanguageModel(embeddings_layer=embedding_layer).to(device)
-    
-    # 체크포인트 로드
-    try:
-        model.load_state_dict(torch.load(args.ckpt_path, map_location=device))
-        print(f"Successfully loaded checkpoint from {args.ckpt_path}")
-    except FileNotFoundError:
-        print(f"Error: Checkpoint file not found at {args.ckpt_path}. Please check the path and run 'train.py' first.")
-        return
+# ------------------------
+# 모델 로드
+# ------------------------
+def load_ckpt(ckpt_path, device):
+    ckpt = torch.load(ckpt_path, map_location=device)
 
-    # 4. 추론 실행
+    vocab = Vocab()
+    vocab.itos = ckpt["vocab_itos"]
+    vocab.stoi = {t: i for i, t in enumerate(vocab.itos)}
+
+    # img_size 제거하여 baseline과 호환
+    model = CrossAttnVLM(
+        vocab_size=len(vocab.itos),
+        dim=ckpt["dim"],
+        pretrained_backbone=not ckpt.get("no_pretrain", False)
+    ).to(device)
+
+    model.load_state_dict(ckpt["model_state"])
     model.eval()
-    results = [] 
-    
-    print("Start prediction on test set...")
-    
+
+    return model, vocab
+
+
+# ------------------------
+# 예측 + 최종 제출 생성
+# ------------------------
+def run_predict_and_filter(args):
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, vocab = load_ckpt(args.ckpt, device)
+
+    # JSON 파일 로드
+    json_files = sorted(glob(os.path.join(args.json_dir, "*.json")))
+
+    # 테스트셋 로더
+    ds = UniDSet(json_files, jpg_dir=args.jpg_dir, vocab=vocab, build_vocab=False)
+    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
+                    num_workers=2, collate_fn=collate_fn)
+
+    rows = []
     with torch.no_grad():
-        pbar = tqdm(test_loader, desc="Prediction")
-        for images, input_ids, attention_mask, instance_ids, resolutions in pbar:
-            images, input_ids, attention_mask = images.to(device), input_ids.to(device), attention_mask.to(device)
-            
-            # Forward Pass: 정규화된 BBox [0, 1] 예측
-            predicted_bbox_norm = model(images, input_ids, attention_mask) 
-            
-            # 예측된 BBox를 CPU로 이동
-            predicted_bbox_norm = predicted_bbox_norm.cpu().numpy()
-            
-            # --- BBox 역정규화 (Denormalization) ---
-            for i in range(images.size(0)):
-                bbox_norm = predicted_bbox_norm[i]
-                instance_id = instance_ids[i]
-                width, height = resolutions[i].tolist() 
-                
-                # 역정규화 (절대 픽셀값: x, y, w, h)
-                bbox_abs = denormalize_bbox(bbox_norm, width, height) 
-                
-                # 결과 저장 (제출 양식에 맞춤)
-                results.append({
-                    'instance_id': instance_id,
-                    'x': bbox_abs[0],
-                    'y': bbox_abs[1],
-                    'w': bbox_abs[2],
-                    'h': bbox_abs[3],
+        for imgs, ids, lens, targets, meta in dl:
+            imgs = imgs.to(device)
+            ids = ids.to(device)
+            lens = lens.to(device)
+
+            pred = model(imgs, ids, lens)
+
+            for i in range(len(meta)):
+                W, H = meta[i]["orig_size"]
+                cx, cy, nw, nh = pred[i].cpu().numpy().tolist()
+
+                x = (cx - nw / 2) * W
+                y = (cy - nh / 2) * H
+                w = nw * W
+                h = nh * H
+
+                rows.append({
+                    "query_id": meta[i]["query_id"],
+                    "query_text": meta[i]["query_text"],
+                    "pred_x": x,
+                    "pred_y": y,
+                    "pred_w": w,
+                    "pred_h": h
                 })
 
-    # 5. 제출 파일 생성
-    df_submission = pd.DataFrame(results)
-    
-    # 제출 파일 형식: instance_id | x | y | w | h 순서로 정렬
-    df_submission = df_submission[['instance_id', 'x', 'y', 'w', 'h']]
-    
-    df_submission.to_csv(args.out_csv, index=False)
-    print(f"\nPrediction completed and submission file saved to {args.out_csv}")
+    pred_df = pd.DataFrame(rows)
+    print("예측 결과 총 개수:", len(pred_df))
 
+    # --------------------------
+    # sample_submission 기반 필터링
+    # --------------------------
+    sample_df = pd.read_csv(args.sample_csv)
+    valid_ids = set(sample_df["query_id"])
+
+    filtered = pred_df[pred_df["query_id"].isin(valid_ids)]
+    print("필터링 후 개수:", len(filtered))
+
+    # 순서 맞추기
+    filtered = filtered.set_index("query_id").loc[sample_df["query_id"]].reset_index()
+
+    os.makedirs(os.path.dirname(args.final_csv), exist_ok=True)
+    filtered.to_csv(args.final_csv, index=False, encoding="utf-8-sig")
+    print(f"[완료] 최종 제출 파일 저장 → {args.final_csv}")
+
+
+# ------------------------
+# main
+# ------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Vision-Language Model Prediction")
-    parser.add_argument('--data_root', type=str, default='./data', help='Root directory of the dataset (default: ./data)')
-    parser.add_argument('--ckpt_path', type=str, required=True, help='Path to the model checkpoint (.pth file)')
-    parser.add_argument('--out_csv', type=str, default='./submission.csv', help='Output path for the submission CSV file')
-    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for prediction')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of worker threads for data loading')
-    
-    args = parser.parse_args()
-    predict_loop(args)
+    parser = argparse.ArgumentParser()
 
-if __name__ == '__main__':
+    parser.add_argument("--ckpt", required=True)
+    parser.add_argument("--json_dir", required=True)
+    parser.add_argument("--jpg_dir", required=True)
+    parser.add_argument("--sample_csv", default="./open/sample_submission.csv")
+    parser.add_argument("--final_csv", default="outputs/preds/final_submit.csv")
+    parser.add_argument("--batch_size", type=int, default=8)
+
+    args = parser.parse_args()
+
+    run_predict_and_filter(args)
+
+
+if __name__ == "__main__":
     main()
